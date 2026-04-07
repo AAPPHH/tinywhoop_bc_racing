@@ -47,8 +47,10 @@ CONFIG = {
     "golden_max_uses": 4,
     "sil_samples_per_update": 8,
     "aux_coef": 1.0,
-    "entropy_coef": 0.0001,
-    "entropy_floor": 6.0,
+    "target_entropy": 6.3,
+    "alpha_lr": 3e-2,
+    "log_alpha_init": math.log(0.01),
+    "log_alpha_clamp": (-5.0, 2.0),
     "resume": "",
 }
 
@@ -80,6 +82,9 @@ class EnvWorker:
 
     def set_dr_scale(self, dr_scale):
         self.env.dr_scale = dr_scale
+
+    def set_alive_disabled(self, val):
+        self.env.set_alive_disabled(val)
 
 
     def collect_trajectory(self):
@@ -458,6 +463,8 @@ def train(cfg):
     ckpt_dir = logger.ckpt_dir
     agent = ActorCritic().to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=cfg["lr"])
+    log_alpha = torch.tensor(cfg["log_alpha_init"], device=device, requires_grad=True)
+    alpha_optimizer = torch.optim.Adam([log_alpha], lr=cfg["alpha_lr"])
     scaler = GradScaler()
     golden = GoldenMemory(capacity=cfg["golden_capacity"], max_uses=cfg["golden_max_uses"])
     academy = AcademyManager()
@@ -465,6 +472,7 @@ def train(cfg):
     dr_gates = deque(maxlen=200)
     global_step = 0
     num_updates = 0
+    alive_disabled = False
     if cfg.get("resume"):
         ckpt = torch.load(cfg["resume"], map_location=device, weights_only=False)
         saved = ckpt["model_state_dict"]
@@ -476,6 +484,11 @@ def train(cfg):
         global_step = ckpt.get("global_step", 0)
         num_updates = ckpt.get("num_updates", 0)
         dr_scale = ckpt.get("dr_scale", 0.0)
+        alive_disabled = ckpt.get("alive_disabled", False)
+        if "log_alpha" in ckpt:
+            log_alpha.data.copy_(torch.tensor(ckpt["log_alpha"], device=device))
+        if "alpha_optimizer_state_dict" in ckpt:
+            alpha_optimizer.load_state_dict(ckpt["alpha_optimizer_state_dict"])
         print(f"Resumed from {cfg['resume']} | Step: {global_step} | Updates: {num_updates} | L:{academy.highest_unlocked} | DR:{dr_scale:.2f}")
         academy.highest_unlocked = 0
         academy.level_success = {i: deque(maxlen=200) for i in range(len(ACADEMY["levels"]))}
@@ -503,6 +516,8 @@ def train(cfg):
     sil_stats = {}
     batch = []
     batch_levels = []
+    if alive_disabled:
+        ray.get([w.set_alive_disabled.remote(True) for w in workers])
     while global_step < cfg["total_timesteps"]:
         ready, _ = ray.wait(list(pending.keys()), num_returns=1)
         future = ready[0]
@@ -549,6 +564,10 @@ def train(cfg):
         ep_meta = list(zip(traj["ep_rewards"], traj["ep_gates"]))
         for ep, (ep_ret, ep_g) in zip(episodes, ep_meta):
             golden.add(ep, ep_ret, ep_g, traj.get("academy_level", 0), dr_scale)
+        if not alive_disabled and golden.gate_fraction() >= 0.25:
+            ray.get([w.set_alive_disabled.remote(True) for w in workers])
+            alive_disabled = True
+            print(f"\n[R_ALIVE] Disabled (GM gate_fraction={golden.gate_fraction():.2f})")
         n_steps = len(traj["rewards"])
         logger.log_steps(
             update=num_updates + 1,
@@ -603,10 +622,10 @@ def train(cfg):
             policy_loss = -(advantages_cat * all_lp).mean()
             value_loss = 0.5 * (all_vn - normalized_targets.detach()).pow(2).mean()
             entropy_mean = all_entropy.mean()
-            entropy_loss = -cfg["entropy_coef"] * entropy_mean
-            entropy_floor_loss = cfg["entropy_coef"] * 10.0 * F.relu(cfg["entropy_floor"] - entropy_mean)
+            alpha = log_alpha.detach().exp()
+            entropy_loss = -alpha * entropy_mean
             aux_loss = F.mse_loss(all_aux_pred, aux_targets)
-            loss = policy_loss + cfg["value_coef"] * value_loss + entropy_loss + entropy_floor_loss + cfg["aux_coef"] * aux_loss
+            loss = policy_loss + cfg["value_coef"] * value_loss + entropy_loss + cfg["aux_coef"] * aux_loss
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -619,11 +638,17 @@ def train(cfg):
         else:
             scaler.update()
             grad_str = "g:SKIP"
+        alpha_loss = (log_alpha.exp() * (entropy_mean.detach().float() - cfg["target_entropy"])).mean()
+        alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        alpha_optimizer.step()
+        with torch.no_grad():
+            log_alpha.data.clamp_(*cfg["log_alpha_clamp"])
         avg_pl = policy_loss.item()
         avg_vl = value_loss.item()
         avg_aux = aux_loss.item()
         avg_ent = all_entropy.mean().item()
-        avg_alpha = cfg["entropy_coef"]
+        avg_alpha = log_alpha.exp().item()
         num_updates += 1
         sil_stats = {}
         if golden.size >= 4:
@@ -676,7 +701,7 @@ def train(cfg):
         print(
             f"[{num_updates:5d}] {fmt_steps(global_step)} {fps:.0f}/s {fmt_time(elapsed)} | "
             f"R:{avg_r:+.1f}({max_r:+.1f}) G:{max_g} | "
-            f"VT p:{avg_pl:.3f} v:{avg_vl:.3f} aux:{avg_aux:.3f} H:{avg_ent:.2f} rho:{avg_rho:.2f} {grad_str} | "
+            f"VT p:{avg_pl:.3f} v:{avg_vl:.3f} aux:{avg_aux:.3f} H:{avg_ent:.2f} a:{avg_alpha:.4f} rho:{avg_rho:.2f} {grad_str} | "
             f"{sil_str} | mu:{pa_mu:.2f} sig:{pa_sigma:.2f} | "
             f"GM:{gm_size}({golden.capacity}) top:{gm_top} | {academy.status_str()} | L:{academy.highest_unlocked} DR:{dr_scale:.2f}"
         )
@@ -701,7 +726,7 @@ def train(cfg):
             update=num_updates, global_step=global_step, elapsed_sec=elapsed, fps=fps,
             avg_reward=avg_r, max_reward=max_r, max_gates=max_g,
             policy_loss=avg_pl, value_loss=avg_vl, aux_loss=avg_aux, entropy=avg_ent,
-            alpha=avg_alpha, target_entropy=cfg["entropy_floor"], ema_slope=0.0,
+            alpha=avg_alpha, target_entropy=cfg["target_entropy"], ema_slope=0.0,
             rho_mean=avg_rho, grad_norm_raw=gn_raw, grad_norm_clipped=gn_clip,
             sil_loss=sil_loss_v, sil_pi=sil_pi_v, sil_v=sil_v_v, sil_frac=sil_frac_v, sil_grad_norm=sil_gn,
             popart_mu=pa_mu, popart_sigma=pa_sigma,
@@ -720,6 +745,9 @@ def train(cfg):
                 "scaler_state_dict": scaler.state_dict(),
                 "academy_highest": academy.highest_unlocked,
                 "dr_scale": dr_scale,
+                "alive_disabled": alive_disabled,
+                "log_alpha": log_alpha.detach().cpu().item(),
+                "alpha_optimizer_state_dict": alpha_optimizer.state_dict(),
             }, str(ckpt_path))
             avg_reward, avg_gates = evaluate_policy(
                 agent, cfg["track"], num_episodes=20, device=device,
@@ -737,6 +765,9 @@ def train(cfg):
                     "academy_highest": academy.highest_unlocked,
                     "avg_gates": avg_gates,
                     "dr_scale": dr_scale,
+                    "alive_disabled": alive_disabled,
+                    "log_alpha": log_alpha.detach().cpu().item(),
+                    "alpha_optimizer_state_dict": alpha_optimizer.state_dict(),
                 }, str(ckpt_dir / "best.pt"))
         batch = []
         batch_levels = []
