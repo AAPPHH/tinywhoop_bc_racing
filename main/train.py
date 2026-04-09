@@ -48,10 +48,16 @@ CONFIG = {
     "sil_samples_per_update": 8,
     "aux_coef": 1.0,
     "target_entropy": 6.3,
-    "alpha_lr": 3e-2,
-    "log_alpha_init": math.log(0.01),
-    "log_alpha_clamp": (-5.0, 2.0),
-    "resume": "",
+    "alpha_lr": 3e-3,
+    "alpha_up_init": 0.3,
+    "alpha_down_init": 0.05,
+    "alpha_up_clamp": (0.01, 0.5),
+    "alpha_down_clamp": (0.01, 0.5),
+    "alpha_blend_width": 0.5,
+    "reset_popart_on_load": True,
+    "value_warmup_policy_coef": 0.1,
+    "value_warmup_v_loss_threshold": 1.0,
+    "resume": r"C:\clones\tinywhoop_bc_racing\lake\impala_circle_small_1775679280\checkpoints\ckpt_2480.pt",
 }
 
 @ray.remote
@@ -150,11 +156,17 @@ class EnvWorker:
                 next_obs, _info = self.env.reset()
                 self._current_track_gates = _info.get("track_gates", [])
             self.obs = next_obs
+        act_diff = np.diff(actions, axis=0)
+        act_jerk = float(np.sqrt((act_diff ** 2).mean())) if len(act_diff) else 0.0
+        gyro = imu[:, -1, 0:3]
+        gyro_diff = np.diff(gyro, axis=0)
+        gyro_jerk = float(np.sqrt((gyro_diff ** 2).mean())) if len(gyro_diff) else 0.0
         return {
             "masks": masks, "imu": imu, "cv2": cv2_feats, "nav": nav_feats,
             "actions_hist": act_hist, "state": state,
             "actions": actions, "bin_indices": bin_indices,
             "behavior_log_probs": blp,
+            "act_jerk": act_jerk, "gyro_jerk": gyro_jerk,
             "rewards": rewards, "dones": dones,
             "gate_idx": gate_idx,
             "ep_rewards": ep_rewards, "ep_gates": ep_gates,
@@ -361,7 +373,7 @@ def compute_sil_loss(agent, trajectories, device, gamma):
         indices = torch.as_tensor(traj["bin_indices"], dtype=torch.int64, device=device)
         rewards = torch.as_tensor(traj["rewards"], dtype=torch.float32, device=device)
         dones = torch.as_tensor(traj["dones"], dtype=torch.float32, device=device)
-        log_probs, _, values, _, _ = agent.evaluate(obs, indices)
+        log_probs, _, _, values, _, _ = agent.evaluate(obs, indices)
         values = values.squeeze(-1)
         T = len(rewards)
         mc_returns = torch.zeros(T, device=device)
@@ -463,8 +475,9 @@ def train(cfg):
     ckpt_dir = logger.ckpt_dir
     agent = ActorCritic().to(device)
     optimizer = torch.optim.Adam(agent.parameters(), lr=cfg["lr"])
-    log_alpha = torch.tensor(cfg["log_alpha_init"], device=device, requires_grad=True)
-    alpha_optimizer = torch.optim.Adam([log_alpha], lr=cfg["alpha_lr"])
+    alpha_up = torch.tensor(cfg["alpha_up_init"], device=device, requires_grad=True)
+    alpha_down = torch.tensor(cfg["alpha_down_init"], device=device, requires_grad=True)
+    alpha_optimizer = torch.optim.Adam([alpha_up, alpha_down], lr=cfg["alpha_lr"])
     scaler = GradScaler()
     golden = GoldenMemory(capacity=cfg["golden_capacity"], max_uses=cfg["golden_max_uses"])
     academy = AcademyManager()
@@ -485,10 +498,21 @@ def train(cfg):
         num_updates = ckpt.get("num_updates", 0)
         dr_scale = ckpt.get("dr_scale", 0.0)
         alive_disabled = ckpt.get("alive_disabled", False)
-        if "log_alpha" in ckpt:
-            log_alpha.data.copy_(torch.tensor(ckpt["log_alpha"], device=device))
-        if "alpha_optimizer_state_dict" in ckpt:
-            alpha_optimizer.load_state_dict(ckpt["alpha_optimizer_state_dict"])
+        if "alpha_up" in ckpt:
+            alpha_up.data.copy_(torch.tensor(ckpt["alpha_up"], device=device))
+        if "alpha_down" in ckpt:
+            alpha_down.data.copy_(torch.tensor(ckpt["alpha_down"], device=device))
+        if cfg.get("reset_popart_on_load", False):
+            with torch.no_grad():
+                agent.critic.popart.mu.zero_()
+                agent.critic.popart.sigma.fill_(1.0)
+                nn.init.kaiming_uniform_(agent.critic.popart.weight, a=math.sqrt(5))
+                bound = 1.0 / math.sqrt(agent.critic.popart.weight.shape[1])
+                nn.init.uniform_(agent.critic.popart.bias, -bound, bound)
+            print("PopArt reset: mu=0, sigma=1, head re-initialized")
+    warmup_active = bool(cfg.get("reset_popart_on_load", False)) and bool(cfg.get("resume"))
+    if warmup_active:
+        print(f"Value-Warmup active: policy_coef={cfg['value_warmup_policy_coef']} until v_loss<{cfg['value_warmup_v_loss_threshold']}")
         print(f"Resumed from {cfg['resume']} | Step: {global_step} | Updates: {num_updates} | L:{academy.highest_unlocked} | DR:{dr_scale:.2f}")
         academy.highest_unlocked = 0
         academy.level_success = {i: deque(maxlen=200) for i in range(len(ACADEMY["levels"]))}
@@ -595,7 +619,7 @@ def train(cfg):
         all_dones = torch.as_tensor(np.concatenate([tr["dones"] for tr in batch]), dtype=torch.float32, device=device)
         all_obs = {"masks": all_masks, "imu": all_imu, "cv2": all_cv2, "nav": all_nav, "actions": all_act_hist, "state": all_state}
         with autocast("cuda"):
-            all_lp, all_entropy, all_vd, all_vn, all_aux_pred = agent.evaluate(all_obs, all_indices)
+            all_lp, all_entropy, _, all_vd, all_vn, all_aux_pred = agent.evaluate(all_obs, all_indices)
             all_vd = all_vd.squeeze(-1)
             all_vn = all_vn.squeeze(-1)
         bootstrap_vals = compute_bootstrap_batched(agent, batch, B, T, device)
@@ -622,10 +646,16 @@ def train(cfg):
             policy_loss = -(advantages_cat * all_lp).mean()
             value_loss = 0.5 * (all_vn - normalized_targets.detach()).pow(2).mean()
             entropy_mean = all_entropy.mean()
-            alpha = log_alpha.detach().exp()
-            entropy_loss = -alpha * entropy_mean
+            delta = entropy_mean.detach() - cfg["target_entropy"]
+            blend = torch.sigmoid(delta / cfg["alpha_blend_width"])
+            alpha_eff = (1.0 - blend) * (-alpha_up.detach()) + blend * alpha_down.detach()
+            entropy_loss = alpha_eff * entropy_mean
             aux_loss = F.mse_loss(all_aux_pred, aux_targets)
-            loss = policy_loss + cfg["value_coef"] * value_loss + entropy_loss + cfg["aux_coef"] * aux_loss
+            policy_coef = cfg["value_warmup_policy_coef"] if warmup_active else 1.0
+            loss = (policy_coef * policy_loss
+                    + cfg["value_coef"] * value_loss
+                    + entropy_loss
+                    + cfg["aux_coef"] * aux_loss)
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -638,17 +668,24 @@ def train(cfg):
         else:
             scaler.update()
             grad_str = "g:SKIP"
-        alpha_loss = (log_alpha.exp() * (entropy_mean.detach().float() - cfg["target_entropy"])).mean()
+        delta_f = (entropy_mean.detach().float() - cfg["target_entropy"])
+        alpha_loss = -alpha_up * F.relu(-delta_f) - alpha_down * F.relu(delta_f)
         alpha_optimizer.zero_grad()
         alpha_loss.backward()
         alpha_optimizer.step()
         with torch.no_grad():
-            log_alpha.data.clamp_(*cfg["log_alpha_clamp"])
+            alpha_up.clamp_(*cfg["alpha_up_clamp"])
+            alpha_down.clamp_(*cfg["alpha_down_clamp"])
         avg_pl = policy_loss.item()
         avg_vl = value_loss.item()
+        if warmup_active and avg_vl < cfg["value_warmup_v_loss_threshold"]:
+            warmup_active = False
+            print(f"[Update {num_updates}] Value-Warmup deactivated: v_loss={avg_vl:.3f} < {cfg['value_warmup_v_loss_threshold']}")
         avg_aux = aux_loss.item()
         avg_ent = all_entropy.mean().item()
-        avg_alpha = log_alpha.exp().item()
+        avg_alpha_up = alpha_up.item()
+        avg_alpha_down = alpha_down.item()
+        avg_alpha = avg_alpha_down if delta_f.item() > 0 else avg_alpha_up
         num_updates += 1
         sil_stats = {}
         if golden.size >= 4:
@@ -690,6 +727,8 @@ def train(cfg):
         pa_mu = agent.critic.popart.mu.item()
         pa_sigma = agent.critic.popart.sigma.item()
         gm_size, gm_top = golden.stats()
+        avg_act_jerk = float(np.mean([tr["act_jerk"] for tr in batch]))
+        avg_gyro_jerk = float(np.mean([tr["gyro_jerk"] for tr in batch]))
         if sil_stats:
             sil_str = (
                 f"SIL:{sil_stats['sil_loss']:.2f} "
@@ -701,9 +740,10 @@ def train(cfg):
         print(
             f"[{num_updates:5d}] {fmt_steps(global_step)} {fps:.0f}/s {fmt_time(elapsed)} | "
             f"R:{avg_r:+.1f}({max_r:+.1f}) G:{max_g} | "
-            f"VT p:{avg_pl:.3f} v:{avg_vl:.3f} aux:{avg_aux:.3f} H:{avg_ent:.2f} a:{avg_alpha:.4f} rho:{avg_rho:.2f} {grad_str} | "
+            f"VT p:{avg_pl:.3f} v:{avg_vl:.3f} aux:{avg_aux:.3f} H:{avg_ent:.2f} au:{avg_alpha_up:.3f} ad:{avg_alpha_down:.3f} rho:{avg_rho:.2f} {grad_str} | "
             f"{sil_str} | mu:{pa_mu:.2f} sig:{pa_sigma:.2f} | "
-            f"GM:{gm_size}({golden.capacity}) top:{gm_top} | {academy.status_str()} | L:{academy.highest_unlocked} DR:{dr_scale:.2f}"
+            f"GM:{gm_size}({golden.capacity}) top:{gm_top} | {academy.status_str()} | L:{academy.highest_unlocked} DR:{dr_scale:.2f} | "
+            f"smooth a:{avg_act_jerk:.3f} g:{avg_gyro_jerk:.2f}"
         )
         level_stats = []
         for i in range(academy.highest_unlocked + 1):
@@ -746,8 +786,8 @@ def train(cfg):
                 "academy_highest": academy.highest_unlocked,
                 "dr_scale": dr_scale,
                 "alive_disabled": alive_disabled,
-                "log_alpha": log_alpha.detach().cpu().item(),
-                "alpha_optimizer_state_dict": alpha_optimizer.state_dict(),
+                "alpha_up": alpha_up.detach().cpu().item(),
+                "alpha_down": alpha_down.detach().cpu().item(),
             }, str(ckpt_path))
             avg_reward, avg_gates = evaluate_policy(
                 agent, cfg["track"], num_episodes=20, device=device,
@@ -766,8 +806,8 @@ def train(cfg):
                     "avg_gates": avg_gates,
                     "dr_scale": dr_scale,
                     "alive_disabled": alive_disabled,
-                    "log_alpha": log_alpha.detach().cpu().item(),
-                    "alpha_optimizer_state_dict": alpha_optimizer.state_dict(),
+                    "alpha_up": alpha_up.detach().cpu().item(),
+                    "alpha_down": alpha_down.detach().cpu().item(),
                 }, str(ckpt_dir / "best.pt"))
         batch = []
         batch_levels = []

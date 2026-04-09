@@ -544,16 +544,11 @@ class GateRacingEnv(gymnasium.Env):
     def _reward_gate_racing(self, pos, vel, euler, ang_vel, passed, offset, action):
         target = self.gate_positions[self._current_gate_idx]
         curr_dist = np.linalg.norm(pos - target)
-        r_prog = self.r_prog * (self._prev_dist - curr_dist)
+        r = self._prev_dist - curr_dist
         self._prev_dist = curr_dist
-        r_gate = 0.0
         if passed:
-            r_gate = 60.0 * (1.0 - min(offset / self.gate_size, 1.0))
-        ang_norm = np.sum(np.abs(ang_vel))
-        r_angular = -(1.0 / (2.0 * CONTROL_HZ * 1e5)) * (math.exp(min(ang_norm, 17.0)) - 1.0)
-        r_smooth = -0.01 * np.sum((action - self._prev_action) ** 2)
-        r_alive = 0.0 if self._alive_disabled else 0.1
-        return r_prog + r_gate + r_angular + r_smooth + r_alive
+            r += 100.0
+        return r
 
     def _check_termination(self, pos, vel, euler):
         lvl = self.academy_level
@@ -583,8 +578,9 @@ class GateRacingEnv(gymnasium.Env):
             self._load_track(track_name)
         g0 = self.gate_positions[0]
         n0 = self.gate_normals[0]
-        self._spawn_pos = g0 - n0 * (0.3 if lvl == 0 else 2.0)
-        self._spawn_noise_xy = 0.05 if lvl == 0 else 0.2
+        spawn_offset = 1.0 if lvl == 0 else 2.0
+        self._spawn_pos = g0 - n0 * spawn_offset
+        self._spawn_noise_xy = 0.2
         self._spawn_noise_rot = 5.0
         self._num_active_gates = self.num_gates
         self._reward_fn = self._reward_gate_racing

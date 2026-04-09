@@ -178,10 +178,11 @@ class ActorCritic(nn.Module):
     def evaluate(self, obs, indices):
         dist, aux_pred = self.actor.get_distribution(obs, return_aux=True)
         log_prob = dist.log_prob(indices).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
+        entropy_per_motor = dist.entropy()
+        entropy = entropy_per_motor.sum(dim=-1)
         value = self.critic(obs)
         normalized_value = self.critic.forward_normalized(obs)
-        return log_prob, entropy, value, normalized_value, aux_pred
+        return log_prob, entropy, entropy_per_motor, value, normalized_value, aux_pred
 
     def update_popart(self, returns):
         self.critic.popart.update_stats(returns)
