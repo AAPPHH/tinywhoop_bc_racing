@@ -315,15 +315,17 @@ class GateRacingEnv(gymnasium.Env):
                              p.LINK_FRAME, physicsClientId=self._physics_client)
         p.applyExternalTorque(self._drone_id, -1, torque_body,
                               p.LINK_FRAME, physicsClientId=self._physics_client)
+        if self._dr_wind_sigma > 0.0 or self._dr_drag > 0.0:
+            pos, orn = self._get_drone_pos_orn()
         if self._dr_wind_sigma > 0.0:
             self._wind += DR_RANGES['wind_theta'] * (0.0 - self._wind) * PHYSICS_DT + \
                           self._dr_wind_sigma * math.sqrt(PHYSICS_DT) * np.random.standard_normal(3)
-            p.applyExternalForce(self._drone_id, -1, self._wind.tolist(), [0, 0, 0],
+            p.applyExternalForce(self._drone_id, -1, self._wind.tolist(), pos.tolist(),
                                  p.WORLD_FRAME, physicsClientId=self._physics_client)
         if self._dr_drag > 0.0:
             lin_vel, _ = self._get_drone_vel()
             drag_force = -self._dr_drag * lin_vel
-            p.applyExternalForce(self._drone_id, -1, drag_force.tolist(), [0, 0, 0],
+            p.applyExternalForce(self._drone_id, -1, drag_force.tolist(), pos.tolist(),
                                  p.WORLD_FRAME, physicsClientId=self._physics_client)
 
     def _get_track_gates(self):
@@ -503,15 +505,12 @@ class GateRacingEnv(gymnasium.Env):
             dot_product = 0.0
         next_idx = (self._current_gate_idx + 1) % self._num_active_gates
         next_pos = self.gate_positions[next_idx]
-        dir_next = next_pos - target
-        dn = np.linalg.norm(dir_next)
-        if dn > 1e-6:
-            dir_next = dir_next / dn
+        pos_rel_next = next_pos - pos
         rpms_norm = self._last_rpms / CF2X_MAX_RPM
         gate_features = self._extract_gate_features(self._current_mask)
         state = np.concatenate([
             pos_rel, lin_vel, euler, ang_vel,
-            [dist], dir_next, gate_normal, [dot_product],
+            [dist], pos_rel_next, gate_normal, [dot_product],
             rpms_norm, self._prev_action,
             gate_features,
         ]).astype(np.float32)
@@ -576,8 +575,13 @@ class GateRacingEnv(gymnasium.Env):
                 3: "championship",
             }.get(lvl, self.track_name)
             self._load_track(track_name)
-        g0 = self.gate_positions[0]
-        n0 = self.gate_normals[0]
+        rng = self.np_random if hasattr(self, 'np_random') and self.np_random is not None else np.random
+        if lvl == 0:
+            self._spawn_gate_idx = int(rng.integers(0, self.num_gates))
+        else:
+            self._spawn_gate_idx = 0
+        g0 = self.gate_positions[self._spawn_gate_idx]
+        n0 = self.gate_normals[self._spawn_gate_idx]
         spawn_offset = 1.0 if lvl == 0 else 2.0
         self._spawn_pos = g0 - n0 * spawn_offset
         self._spawn_noise_xy = 0.2
@@ -644,7 +648,7 @@ class GateRacingEnv(gymnasium.Env):
         start_pos[1] += noise_xy[1]
         self._start_xy = start_pos[:2].copy()
         noise_rot = self.np_random.normal(0, math.radians(self._spawn_noise_rot))
-        yaw = self.gate_yaws_rad[0] + noise_rot
+        yaw = self.gate_yaws_rad[self._spawn_gate_idx] + noise_rot
         start_orn = p.getQuaternionFromEuler([0, 0, yaw])
         p.resetBasePositionAndOrientation(
             self._drone_id, start_pos.tolist(), list(start_orn),
@@ -655,7 +659,7 @@ class GateRacingEnv(gymnasium.Env):
             physicsClientId=self._physics_client,
         )
         self._step_count = 0
-        self._current_gate_idx = 0
+        self._current_gate_idx = self._spawn_gate_idx
         self._gates_passed = 0
         self._yaw_at_gate_pass = yaw
         self._step_at_gate_pass = 0
@@ -663,8 +667,8 @@ class GateRacingEnv(gymnasium.Env):
         self._last_rpms = np.zeros(4, dtype=np.float64)
         self._prev_action = np.zeros(4, dtype=np.float64)
         self._prev_lin_vel = np.zeros(3, dtype=np.float64)
-        rel = start_pos - self.gate_positions[0]
-        self._prev_dot = np.dot(rel, self.gate_normals[0])
+        rel = start_pos - self.gate_positions[self._spawn_gate_idx]
+        self._prev_dot = np.dot(rel, self.gate_normals[self._spawn_gate_idx])
         target = self._get_target()
         self._prev_dist = np.linalg.norm(start_pos - target)
         self._mask_window = collections.deque(

@@ -56,7 +56,7 @@ class Actor(nn.Module):
             nn.Linear(64, 4 * NUM_BINS),
         )
         self.register_buffer('bins', torch.linspace(-1.0, 1.0, NUM_BINS))
-        self.aux_head = nn.Linear(32, 8)
+        self.aux_head = nn.Linear(32, 12)
 
     def forward(self, obs, return_aux=False):
         imu = obs["imu"]

@@ -44,7 +44,7 @@ CONFIG = {
     "total_timesteps": 500_000_000,
     "sil_coef": 0.25,
     "golden_capacity": 256,
-    "golden_max_uses": 4,
+    "golden_max_uses": 8,
     "sil_samples_per_update": 8,
     "aux_coef": 1.0,
     "target_entropy": 6.3,
@@ -54,10 +54,10 @@ CONFIG = {
     "alpha_up_clamp": (0.01, 0.5),
     "alpha_down_clamp": (0.01, 0.5),
     "alpha_blend_width": 0.5,
-    "reset_popart_on_load": True,
+    "reset_popart_on_load": False,
     "value_warmup_policy_coef": 0.1,
     "value_warmup_v_loss_threshold": 1.0,
-    "resume": r"C:\clones\tinywhoop_bc_racing\lake\impala_circle_small_1775679280\checkpoints\ckpt_2480.pt",
+    "resume": r"",
 }
 
 @ray.remote
@@ -257,19 +257,19 @@ class GoldenMemory:
         return r_shift * 0.01 * lvl * dr
 
     def _evict_idx(self):
-        scores = self._score() + self.returns[:self.size] * 1e-6
+        scores = self._score() + self.returns[:self.size] * 1e-2
         return int(np.argmin(scores))
 
     def add(self, traj, ret, gates, level, dr_scale=0.0):
         if ret <= 0 and gates == 0:
             return False
-        new_score = self._compute_score(gates, ret, level, dr_scale) + ret * 1e-6
+        new_score = self._compute_score(gates, ret, level, dr_scale) + ret * 1e-2
         if self.size < self.capacity:
             idx = self.size
             self.size += 1
         else:
             idx = self._evict_idx()
-            evict_score = self._score()[idx] + self.returns[idx] * 1e-6
+            evict_score = self._score()[idx] + self.returns[idx] * 1e-2
             if new_score <= evict_score:
                 return False
         self.buffer[idx] = traj
@@ -632,6 +632,8 @@ def train(cfg):
             )
         agent.update_popart(vtargets_cat)
         normalized_targets = agent.normalize_targets(vtargets_cat)
+        pos_rel_next = all_state[:, 13:16]
+        dist_next = torch.linalg.norm(pos_rel_next, dim=-1)
         aux_targets = torch.stack([
             all_state[:, 0] / 10.0,
             all_state[:, 1] / 10.0,
@@ -641,6 +643,10 @@ def train(cfg):
             all_state[:, 3] / 5.0,
             all_state[:, 4] / 5.0,
             all_state[:, 5] / 3.0,
+            pos_rel_next[:, 0] / 10.0,
+            pos_rel_next[:, 1] / 10.0,
+            pos_rel_next[:, 2] / 4.0,
+            dist_next / 10.0,
         ], dim=-1).detach()
         with autocast("cuda"):
             policy_loss = -(advantages_cat * all_lp).mean()
