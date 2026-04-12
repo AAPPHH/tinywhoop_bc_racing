@@ -81,6 +81,14 @@ CAM_MASK_H = 60
 GYRO_NOISE_STD = 0.01
 ACCEL_NOISE_STD = 0.05
 
+Q_CAPACITY = 1.080
+R_INTERNAL_BASE = 0.040
+R_SAG_COEFF = 2.0
+V_CUTOFF = 3.3
+K_MOTOR = 3.4e-14
+SOC_POINTS = np.array([0.00, 0.05, 0.10, 0.20, 0.30, 0.50, 0.70, 0.80, 0.90, 1.00])
+OCV_POINTS = np.array([3.00, 3.30, 3.50, 3.68, 3.75, 3.83, 3.92, 3.97, 4.06, 4.20])
+
 DR_BASELINE = {
     'mass': CF2X_MASS,
     'ixx': CF2X_IXX,
@@ -89,6 +97,9 @@ DR_BASELINE = {
     'kf': CF2X_KF,
     'motor_tau': 0.030,
     'drag_coef': 0.01,
+    'q_capacity': Q_CAPACITY,
+    'r_internal': R_INTERNAL_BASE,
+    'r_sag': R_SAG_COEFF,
 }
 DR_RANGES = {
     'mass':         (-0.15, +0.15),
@@ -101,8 +112,32 @@ DR_RANGES = {
     'wind_sigma':   0.3,
     'wind_theta':   0.1,
     'com_offset':   0.003,
+    'q_capacity':   (0.70, 1.50),
+    'r_internal':   (0.60, 2.00),
+    'r_sag':        (0.50, 2.00),
 }
 PHYSICS_DT = 1.0 / PHYSICS_HZ
+
+
+class LiPoBattery:
+    def __init__(self, q_capacity=Q_CAPACITY, r_internal=R_INTERNAL_BASE, r_sag=R_SAG_COEFF):
+        self.q_capacity = q_capacity
+        self.r_internal = r_internal
+        self.r_sag = r_sag
+        self.soc = 1.0
+        self.v_terminal = np.interp(1.0, SOC_POINTS, OCV_POINTS)
+        self.rpm_ceiling = CF2X_MAX_RPM
+
+    def step(self, rpms):
+        ocv = np.interp(self.soc, SOC_POINTS, OCV_POINTS)
+        r = self.r_internal * (1.0 + self.r_sag * (1.0 - self.soc) ** 2)
+        p_total = K_MOTOR * np.sum(rpms ** 3)
+        i_total = p_total / max(ocv, 3.0)
+        self.soc -= i_total * PHYSICS_DT / self.q_capacity
+        self.soc = max(self.soc, 0.0)
+        self.v_terminal = ocv - i_total * r
+        self.rpm_ceiling = CF2X_MAX_RPM * max(self.v_terminal / 4.20, 0.0)
+        return self.v_terminal, self.soc, self.rpm_ceiling
 
 WINDOW_LEN = 16
 TEMPORAL_DIM = 30
@@ -483,8 +518,8 @@ class GateRacingEnv(gymnasium.Env):
         euler_norm = np.clip(np.array(euler) / math.pi, -1.0, 1.0)
         alt = np.clip(pos[2] / 3.0, 0.0, 1.0)
         heading_delta = np.clip((euler[2] - self._yaw_at_gate_pass) / math.pi, -1.0, 1.0)
-        time_since = np.clip((self._step_count - self._step_at_gate_pass) / max(self._max_steps, 1), 0.0, 1.0)
-        return np.array([euler_norm[0], euler_norm[1], euler_norm[2], alt, heading_delta, time_since], dtype=np.float32)
+        soc = self._battery.soc
+        return np.array([euler_norm[0], euler_norm[1], euler_norm[2], alt, heading_delta, soc], dtype=np.float32)
 
     def _get_target(self):
         return self.gate_positions[self._current_gate_idx]
@@ -541,14 +576,11 @@ class GateRacingEnv(gymnasium.Env):
     def _reward_gate_racing(self, pos, vel, euler, ang_vel, passed, offset, action):
         target = self.gate_positions[self._current_gate_idx]
         curr_dist = np.linalg.norm(pos - target)
-        r_prog = self._prev_dist - curr_dist
+        r = self._prev_dist - curr_dist
         self._prev_dist = curr_dist
-        r_gate = 100.0 if passed else 0.0
-        ang_speed_sq = float(np.dot(ang_vel, ang_vel))
-        r_angular = -0.0001 * ang_speed_sq
-        action_delta = action - self._prev_action
-        r_smooth = -0.005 * float(np.dot(action_delta, action_delta))
-        return r_prog + r_gate + r_angular + r_smooth
+        if passed:
+            r += 100.0
+        return r
 
     def _check_termination(self, pos, vel, euler):
         lvl = self.academy_level
@@ -604,6 +636,9 @@ class GateRacingEnv(gymnasium.Env):
             self._dr_action_delay = 0
             self._dr_wind_sigma = 0.0
             self._dr_com_offset = np.zeros(3, dtype=np.float64)
+            self._dr_q_capacity = DR_BASELINE['q_capacity']
+            self._dr_r_internal = DR_BASELINE['r_internal']
+            self._dr_r_sag = DR_BASELINE['r_sag']
             return
         rng = self.np_random if hasattr(self, 'np_random') and self.np_random is not None else np.random
         u = lambda lo, hi: rng.uniform(lo, hi)
@@ -622,6 +657,9 @@ class GateRacingEnv(gymnasium.Env):
         com_dir = rng.standard_normal(3)
         com_dir /= np.linalg.norm(com_dir) + 1e-12
         self._dr_com_offset = com_dir * com_mag
+        self._dr_q_capacity = DR_BASELINE['q_capacity'] * (1.0 + u(*DR_RANGES['q_capacity']) * s)
+        self._dr_r_internal = DR_BASELINE['r_internal'] * (1.0 + u(*DR_RANGES['r_internal']) * s)
+        self._dr_r_sag = DR_BASELINE['r_sag'] * (1.0 + u(*DR_RANGES['r_sag']) * s)
 
     def _apply_dr_to_body(self):
         p.changeDynamics(
@@ -638,6 +676,11 @@ class GateRacingEnv(gymnasium.Env):
         self._setup_level()
         self._sample_dr()
         self._apply_dr_to_body()
+        self._battery = LiPoBattery(
+            q_capacity=self._dr_q_capacity,
+            r_internal=self._dr_r_internal,
+            r_sag=self._dr_r_sag,
+        )
         self._motor_state = np.ones(4, dtype=np.float64) * CF2X_HOVER_RPM
         self._action_delay_buf = collections.deque(maxlen=max(self._dr_action_delay + 1, 1))
         for _ in range(self._dr_action_delay + 1):
@@ -702,17 +745,20 @@ class GateRacingEnv(gymnasium.Env):
         self._action_delay_buf.append(clipped_action.copy())
         delayed_action = self._action_delay_buf[0]
         target_rpms = CF2X_HOVER_RPM + delayed_action * HOVER_DELTA
-        target_rpms = np.clip(target_rpms, 0.0, CF2X_MAX_RPM)
+        target_rpms = np.clip(target_rpms, 0.0, self._battery.rpm_ceiling)
         if self.dr_scale <= 0.0:
             self._motor_state = target_rpms
             for _ in range(SIM_STEPS_PER_CTRL):
                 self._apply_motors(self._motor_state)
+                self._battery.step(self._motor_state)
                 p.stepSimulation(physicsClientId=self._physics_client)
         else:
             tau = max(self._dr_motor_tau, 1e-6)
             for _ in range(SIM_STEPS_PER_CTRL):
                 self._motor_state += (target_rpms - self._motor_state) * (PHYSICS_DT / tau)
+                self._motor_state = np.clip(self._motor_state, 0.0, self._battery.rpm_ceiling)
                 self._apply_motors(self._motor_state)
+                self._battery.step(self._motor_state)
                 p.stepSimulation(physicsClientId=self._physics_client)
         self._step_count += 1
         pos, orn = self._get_drone_pos_orn()
@@ -730,7 +776,7 @@ class GateRacingEnv(gymnasium.Env):
             target = self.gate_positions[self._current_gate_idx]
             self._prev_dist = np.linalg.norm(pos - target)
         terminated, term_reason = self._check_termination(pos, lin_vel, euler)
-        truncated = self._step_count >= self._max_steps
+        truncated = self._battery.v_terminal < V_CUTOFF or self._step_count >= 2000
         if terminated:
             reward = 0.0
             if self._gates_passed > 0:

@@ -86,5 +86,47 @@ class EnvInvariants(unittest.TestCase):
         self.assertFalse(crashed, "action=zeros caused a crash within 50 steps (drag-CoM regression)")
 
 
+    def test_battery_drains_with_motors(self):
+        self.env.reset()
+        soc_before = self.env._battery.soc
+        _step_zero(self.env, 100)
+        soc_after = self.env._battery.soc
+        self.assertLess(soc_after, soc_before, "battery SOC did not drain after 100 hover steps")
+        self.assertGreater(soc_after, 0.5, "battery drained too fast at hover")
+
+    def test_higher_rpm_drains_faster(self):
+        self.env.reset()
+        _step_zero(self.env, 50)
+        soc_hover = self.env._battery.soc
+        self.env.reset()
+        _step_uniform(self.env, 1.0, 50)
+        soc_max = self.env._battery.soc
+        self.assertGreater(soc_hover, soc_max,
+                           f"hover SOC {soc_hover:.3f} should be > max-throttle SOC {soc_max:.3f}")
+
+    def test_battery_cutoff_terminates(self):
+        self.env.reset()
+        truncated = False
+        for _ in range(2000):
+            _, _, term, trunc, _ = self.env.step(np.ones(4, dtype=np.float32))
+            if trunc:
+                truncated = True
+                break
+            if term:
+                break
+        if not truncated:
+            return
+        self.assertLess(self.env._battery.v_terminal, 3.3,
+                        "truncated but voltage above cutoff")
+
+    def test_rpm_ceiling_drops_with_soc(self):
+        self.env.reset()
+        ceil_full = self.env._battery.rpm_ceiling
+        _step_uniform(self.env, 0.5, 200)
+        ceil_later = self.env._battery.rpm_ceiling
+        self.assertLess(ceil_later, ceil_full,
+                        f"rpm_ceiling should drop as SOC decreases: {ceil_full:.0f} -> {ceil_later:.0f}")
+
+
 if __name__ == "__main__":
     unittest.main()
