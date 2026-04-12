@@ -18,7 +18,7 @@ def make_obs(B, device="cpu"):
     return {
         "temporal": torch.randn(B, WINDOW_LEN, TEMPORAL_DIM, device=device),
         "state": torch.randn(B, STATE_DIM, device=device),
-        "masks": torch.zeros(B, WINDOW_LEN, 2, 60, 80, device=device),
+        "masks": torch.zeros(B, 1, 2, 60, 80, device=device),
     }
 
 

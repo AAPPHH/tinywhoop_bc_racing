@@ -106,6 +106,7 @@ PHYSICS_DT = 1.0 / PHYSICS_HZ
 
 WINDOW_LEN = 16
 TEMPORAL_DIM = 30
+MASK_WINDOW_LEN = 1
 CEILING = 4.0
 RED_THRESHOLD = 0.6
 
@@ -139,7 +140,7 @@ class GateRacingEnv(gymnasium.Env):
             np.zeros(self.num_gates),
         ], axis=-1)
         self.observation_space = spaces.Dict({
-            "masks":    spaces.Box(0.0, 1.0, shape=(WINDOW_LEN, 2, CAM_MASK_H, CAM_MASK_W), dtype=np.float32),
+            "masks":    spaces.Box(0.0, 1.0, shape=(MASK_WINDOW_LEN, 2, CAM_MASK_H, CAM_MASK_W), dtype=np.float32),
             "temporal": spaces.Box(-np.inf, np.inf, shape=(WINDOW_LEN, TEMPORAL_DIM), dtype=np.float32),
             "state":    spaces.Box(-np.inf, np.inf, shape=(38,), dtype=np.float32),
         })
@@ -540,11 +541,14 @@ class GateRacingEnv(gymnasium.Env):
     def _reward_gate_racing(self, pos, vel, euler, ang_vel, passed, offset, action):
         target = self.gate_positions[self._current_gate_idx]
         curr_dist = np.linalg.norm(pos - target)
-        r = self._prev_dist - curr_dist
+        r_prog = self._prev_dist - curr_dist
         self._prev_dist = curr_dist
-        if passed:
-            r += 100.0
-        return r
+        r_gate = 100.0 if passed else 0.0
+        ang_speed_sq = float(np.dot(ang_vel, ang_vel))
+        r_angular = -0.0001 * ang_speed_sq
+        action_delta = action - self._prev_action
+        r_smooth = -0.005 * float(np.dot(action_delta, action_delta))
+        return r_prog + r_gate + r_angular + r_smooth
 
     def _check_termination(self, pos, vel, euler):
         lvl = self.academy_level
@@ -669,8 +673,8 @@ class GateRacingEnv(gymnasium.Env):
         target = self._get_target()
         self._prev_dist = np.linalg.norm(start_pos - target)
         self._mask_window = collections.deque(
-            [np.zeros((2, CAM_MASK_H, CAM_MASK_W), dtype=np.float32) for _ in range(WINDOW_LEN)],
-            maxlen=WINDOW_LEN,
+            [np.zeros((2, CAM_MASK_H, CAM_MASK_W), dtype=np.float32) for _ in range(MASK_WINDOW_LEN)],
+            maxlen=MASK_WINDOW_LEN,
         )
         self._temporal_window = collections.deque(
             [np.zeros(TEMPORAL_DIM, dtype=np.float32) for _ in range(WINDOW_LEN)],

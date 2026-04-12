@@ -10,7 +10,7 @@ import numpy as np
 from env import GateRacingEnv
 from models import ActorCritic
 
-CKPT = r"C:\clones\tinywhoop_bc_racing\lake\impala_circle_small_1775546319\checkpoints\ckpt_1500.pt"
+CKPT = r"C:\clones\tinywhoop_bc_racing\lake\impala_circle_small_1776003046\checkpoints\ckpt_140.pt"
 TRACK = "easy_circle"
 LEVEL = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 NUM_EPISODES = 50

@@ -40,7 +40,7 @@ CONFIG = {
     "max_grad_norm": 10.0,
     "num_workers": 16,
     "trajectory_length": 256, 
-    "learner_batch": 128,
+    "learner_batch": 256,
     "total_timesteps": 500_000_000,
     "sil_coef": 0.25,
     "golden_capacity": 256,
@@ -48,16 +48,16 @@ CONFIG = {
     "sil_samples_per_update": 8,
     "aux_coef": 1.0,
     "target_entropy": 6.3,
-    "alpha_lr": 3e-3,
+    "alpha_lr": 1e-2,
     "alpha_up_init": 0.3,
-    "alpha_down_init": 0.05,
+    "alpha_down_init": 0.1,
     "alpha_up_clamp": (0.01, 0.5),
-    "alpha_down_clamp": (0.01, 0.5),
+    "alpha_down_clamp": (0.01, 1.0),
     "alpha_blend_width": 0.5,
     "reset_popart_on_load": False,
     "value_warmup_policy_coef": 0.1,
     "value_warmup_v_loss_threshold": 1.0,
-    "resume": r"",
+    "resume": "",
 }
 
 @ray.remote
@@ -96,7 +96,7 @@ class EnvWorker:
     def collect_trajectory(self):
         th = self._torch
         T = self.trajectory_length
-        masks = np.zeros((T, 16, 2, 60, 80), dtype=np.float32)
+        masks = np.zeros((T, 1, 2, 60, 80), dtype=np.float32)
         temporal = np.zeros((T, 16, 30), dtype=np.float32)
         state = np.zeros((T, 38), dtype=np.float32)
         actions = np.zeros((T, 4), dtype=np.float32)
@@ -216,9 +216,10 @@ class AcademyManager:
         return " ".join(parts)
 
 class GoldenMemory:
-    def __init__(self, capacity, max_uses):
+    def __init__(self, capacity, max_uses, device="cpu"):
         self.capacity = capacity
         self.max_uses = max_uses
+        self.device = torch.device(device)
         self.buffer = [None] * capacity
         self.returns = np.zeros(capacity, dtype=np.float32)
         self.gates = np.zeros(capacity, dtype=np.float32)
@@ -262,7 +263,14 @@ class GoldenMemory:
             evict_score = self._score()[idx] + self.returns[idx] * 1e-2
             if new_score <= evict_score:
                 return False
-        self.buffer[idx] = traj
+        gpu_traj = {}
+        for k, v in traj.items():
+            if isinstance(v, np.ndarray) and k in ("temporal", "state", "bin_indices", "rewards", "dones"):
+                dt = torch.int64 if k == "bin_indices" else torch.float32
+                gpu_traj[k] = torch.as_tensor(v, dtype=dt, device=self.device)
+            else:
+                gpu_traj[k] = v
+        self.buffer[idx] = gpu_traj
         self.returns[idx] = ret
         self.gates[idx] = gates
         self.levels[idx] = level
@@ -352,14 +360,17 @@ def compute_sil_loss(agent, trajectories, device, gamma):
     total_adv = 0.0
     total_frac = 0.0
     for traj in trajectories:
+        def _ensure(v, dtype=torch.float32):
+            if isinstance(v, torch.Tensor):
+                return v
+            return torch.as_tensor(v, dtype=dtype, device=device)
         obs = {
-            "masks": torch.as_tensor(traj["masks"], dtype=torch.float32, device=device),
-            "temporal": torch.as_tensor(traj["temporal"], dtype=torch.float32, device=device),
-            "state": torch.as_tensor(traj["state"], dtype=torch.float32, device=device),
+            "temporal": _ensure(traj["temporal"]),
+            "state": _ensure(traj["state"]),
         }
-        indices = torch.as_tensor(traj["bin_indices"], dtype=torch.int64, device=device)
-        rewards = torch.as_tensor(traj["rewards"], dtype=torch.float32, device=device)
-        dones = torch.as_tensor(traj["dones"], dtype=torch.float32, device=device)
+        indices = _ensure(traj["bin_indices"], torch.int64)
+        rewards = _ensure(traj["rewards"])
+        dones = _ensure(traj["dones"])
         log_probs, _, _, values, _, _ = agent.evaluate(obs, indices)
         values = values.squeeze(-1)
         T = len(rewards)
@@ -398,11 +409,12 @@ def compute_bootstrap_batched(agent, batch, B, T, device):
     bootstrap_vals = torch.zeros(B, device=device)
     if len(valid_bi) > 0:
         boot_obs = {}
-        for key, tkey in [("masks", "masks"), ("temporal", "temporal"), ("state", "state")]:
-            boot_obs[key] = torch.as_tensor(
-                np.stack([batch[i][tkey][boot_idx[i]] for i in valid_bi]),
-                dtype=torch.float32, device=device,
-            )
+        for key in ["temporal", "state"]:
+            slices = [batch[i][key][boot_idx[i]] for i in valid_bi]
+            if isinstance(slices[0], torch.Tensor):
+                boot_obs[key] = torch.stack(slices)
+            else:
+                boot_obs[key] = torch.as_tensor(np.stack(slices), dtype=torch.float32, device=device)
         with torch.no_grad():
             bv = agent.get_value(boot_obs).squeeze(-1).float()
         bootstrap_vals[torch.as_tensor(valid_bi, dtype=torch.long, device=device)] = bv
@@ -465,7 +477,7 @@ def train(cfg):
     alpha_down = torch.tensor(cfg["alpha_down_init"], device=device, requires_grad=True)
     alpha_optimizer = torch.optim.Adam([alpha_up, alpha_down], lr=cfg["alpha_lr"])
     scaler = GradScaler()
-    golden = GoldenMemory(capacity=cfg["golden_capacity"], max_uses=cfg["golden_max_uses"])
+    golden = GoldenMemory(capacity=cfg["golden_capacity"], max_uses=cfg["golden_max_uses"], device=device)
     academy = AcademyManager()
     dr_scale = 0.0
     dr_gates = deque(maxlen=200)
@@ -593,14 +605,18 @@ def train(cfg):
         if len(batch) < B:
             continue
         update_start = time.time()
-        all_masks = torch.as_tensor(np.concatenate([tr["masks"] for tr in batch]), dtype=torch.float32, device=device)
-        all_temporal = torch.as_tensor(np.concatenate([tr["temporal"] for tr in batch]), dtype=torch.float32, device=device)
-        all_state = torch.as_tensor(np.concatenate([tr["state"] for tr in batch]), dtype=torch.float32, device=device)
-        all_indices = torch.as_tensor(np.concatenate([tr["bin_indices"] for tr in batch]), dtype=torch.int64, device=device)
-        all_blp = torch.as_tensor(np.concatenate([tr["behavior_log_probs"] for tr in batch]), dtype=torch.float32, device=device)
-        all_rewards = torch.as_tensor(np.concatenate([tr["rewards"] for tr in batch]), dtype=torch.float32, device=device)
-        all_dones = torch.as_tensor(np.concatenate([tr["dones"] for tr in batch]), dtype=torch.float32, device=device)
-        all_obs = {"masks": all_masks, "temporal": all_temporal, "state": all_state}
+        def _to_gpu(arr, dtype=torch.float32):
+            t = torch.as_tensor(arr, dtype=dtype)
+            if device.type == "cuda":
+                return t.pin_memory().to(device, non_blocking=True)
+            return t
+        all_temporal = _to_gpu(np.concatenate([tr["temporal"] for tr in batch]))
+        all_state = _to_gpu(np.concatenate([tr["state"] for tr in batch]))
+        all_indices = _to_gpu(np.concatenate([tr["bin_indices"] for tr in batch]), torch.int64)
+        all_blp = _to_gpu(np.concatenate([tr["behavior_log_probs"] for tr in batch]))
+        all_rewards = _to_gpu(np.concatenate([tr["rewards"] for tr in batch]))
+        all_dones = _to_gpu(np.concatenate([tr["dones"] for tr in batch]))
+        all_obs = {"temporal": all_temporal, "state": all_state}
         with autocast("cuda"):
             all_lp, all_entropy, _, all_vd, all_vn, all_aux_pred = agent.evaluate(all_obs, all_indices)
             all_vd = all_vd.squeeze(-1)

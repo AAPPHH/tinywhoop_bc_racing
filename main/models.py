@@ -110,7 +110,7 @@ class Actor(nn.Module):
 
 
 class PopArtLayer(nn.Module):
-    def __init__(self, in_features, out_features, beta=3e-4):
+    def __init__(self, in_features, out_features, beta=1e-2):
         super().__init__()
         self.beta = beta
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
