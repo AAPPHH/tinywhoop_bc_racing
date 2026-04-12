@@ -6,7 +6,7 @@ from torch.distributions import Categorical
 
 
 def ortho_init(module, gain=1.0):
-    if isinstance(module, (nn.Linear, nn.Conv2d)):
+    if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
         nn.init.orthogonal_(module.weight, gain=gain)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
@@ -40,44 +40,65 @@ class RunningMeanStd(nn.Module):
 
 
 NUM_BINS = 51
+TEMPORAL_DIM = 30
+
+
+class CausalConvNeXtBlock(nn.Module):
+    def __init__(self, dim, kernel_size=7, expansion=4):
+        super().__init__()
+        self.pad = kernel_size - 1
+        self.dw = nn.Conv1d(dim, dim, kernel_size, groups=dim, padding=0)
+        self.norm = nn.LayerNorm(dim)
+        self.pw1 = nn.Linear(dim, dim * expansion)
+        self.act = nn.GELU()
+        self.pw2 = nn.Linear(dim * expansion, dim)
+
+    def forward(self, x):
+        residual = x
+        x = F.pad(x, (self.pad, 0))
+        x = self.dw(x)
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+        x = self.pw1(x)
+        x = self.act(x)
+        x = self.pw2(x)
+        x = x.transpose(1, 2)
+        return x + residual
+
 
 class Actor(nn.Module):
     def __init__(self):
         super().__init__()
-        self.imu_rms = RunningMeanStd((10,))
-        self.cv2_rms = RunningMeanStd((10,))
-        self.cv2_proj = nn.Linear(10, 32)
-        self.imu_proj = nn.Linear(40, 32)
-        self.nav_proj = nn.Linear(6, 16)
-        self.act_proj = nn.Linear(16, 16)
+        self.temporal_rms = RunningMeanStd((TEMPORAL_DIM,))
+        self.proj = nn.Linear(TEMPORAL_DIM, 64)
+        self.blocks = nn.Sequential(
+            CausalConvNeXtBlock(64, kernel_size=7, expansion=4),
+            CausalConvNeXtBlock(64, kernel_size=7, expansion=4),
+            CausalConvNeXtBlock(64, kernel_size=7, expansion=4),
+            CausalConvNeXtBlock(64, kernel_size=7, expansion=4),
+        )
         self.head = nn.Sequential(
-            nn.Linear(96, 64),
-            nn.ReLU(),
-            nn.Linear(64, 4 * NUM_BINS),
+            nn.Linear(64, 256),
+            nn.GELU(),
+            nn.Linear(256, 4 * NUM_BINS),
         )
         self.register_buffer('bins', torch.linspace(-1.0, 1.0, NUM_BINS))
-        self.aux_head = nn.Linear(32, 12)
+        self.aux_head = nn.Linear(64, 12)
 
     def forward(self, obs, return_aux=False):
-        imu = obs["imu"]
-        cv2_feat = obs["cv2"]
-        nav_feat = obs["nav"]
-        act_hist = obs["actions"]
-        B = cv2_feat.shape[0]
+        x = obs["temporal"]
+        B = x.shape[0]
         if self.training:
-            self.imu_rms.update(imu.reshape(-1, 10))
-            self.cv2_rms.update(cv2_feat)
-        imu_normed = self.imu_rms.normalize(imu)
-        cv2_normed = self.cv2_rms.normalize(cv2_feat)
-        cv2_f = F.relu(self.cv2_proj(cv2_normed))
-        imu_f = self.imu_proj(imu_normed.reshape(B, -1))
-        nav_f = F.relu(self.nav_proj(nav_feat))
-        act_f = self.act_proj(act_hist.reshape(B, -1))
-        combined = torch.cat([cv2_f, imu_f, nav_f, act_f], dim=-1)
-        logits = self.head(combined).view(B, 4, NUM_BINS)
+            self.temporal_rms.update(x.reshape(-1, TEMPORAL_DIM))
+        x = self.temporal_rms.normalize(x)
+        x = self.proj(x)
+        x = x.transpose(1, 2)
+        x = self.blocks(x)
+        feat = x[:, :, -1]
+        logits = self.head(feat).view(B, 4, NUM_BINS)
         logits = logits - logits.mean(dim=-1, keepdim=True)
         if return_aux:
-            aux_pred = self.aux_head(cv2_f)
+            aux_pred = self.aux_head(feat)
             return logits, aux_pred
         return logits
 
@@ -155,7 +176,7 @@ class ActorCritic(nn.Module):
         self.actor = Actor()
         self.critic = Critic()
         for m in self.modules():
-            if isinstance(m, (nn.Linear, nn.Conv2d)):
+            if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d)):
                 ortho_init(m, gain=math.sqrt(2))
         ortho_init(self.actor.head[-1], gain=0.01)
         ortho_init(self.critic.popart, gain=1.0)

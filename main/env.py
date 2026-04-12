@@ -104,7 +104,8 @@ DR_RANGES = {
 }
 PHYSICS_DT = 1.0 / PHYSICS_HZ
 
-WINDOW_LEN = 4
+WINDOW_LEN = 16
+TEMPORAL_DIM = 30
 CEILING = 4.0
 RED_THRESHOLD = 0.6
 
@@ -138,12 +139,9 @@ class GateRacingEnv(gymnasium.Env):
             np.zeros(self.num_gates),
         ], axis=-1)
         self.observation_space = spaces.Dict({
-            "masks":   spaces.Box(0.0, 1.0, shape=(WINDOW_LEN, 2, CAM_MASK_H, CAM_MASK_W), dtype=np.float32),
-            "imu":     spaces.Box(-np.inf, np.inf, shape=(WINDOW_LEN, 10), dtype=np.float32),
-            "cv2":     spaces.Box(-np.inf, np.inf, shape=(10,), dtype=np.float32),
-            "nav":     spaces.Box(-1.0, 1.0, shape=(6,), dtype=np.float32),
-            "actions": spaces.Box(-1.0, 1.0, shape=(WINDOW_LEN, 4), dtype=np.float32),
-            "state":   spaces.Box(-np.inf, np.inf, shape=(38,), dtype=np.float32),
+            "masks":    spaces.Box(0.0, 1.0, shape=(WINDOW_LEN, 2, CAM_MASK_H, CAM_MASK_W), dtype=np.float32),
+            "temporal": spaces.Box(-np.inf, np.inf, shape=(WINDOW_LEN, TEMPORAL_DIM), dtype=np.float32),
+            "state":    spaces.Box(-np.inf, np.inf, shape=(38,), dtype=np.float32),
         })
         self.action_space = spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32)
         self.academy_level = academy_level
@@ -152,8 +150,7 @@ class GateRacingEnv(gymnasium.Env):
         self._drone_id = None
         self._gate_visual_ids = []
         self._mask_window = None
-        self._imu_window = None
-        self._action_window = None
+        self._temporal_window = None
         self._step_count = 0
         self._current_gate_idx = 0
         self._gates_passed = 0
@@ -675,26 +672,22 @@ class GateRacingEnv(gymnasium.Env):
             [np.zeros((2, CAM_MASK_H, CAM_MASK_W), dtype=np.float32) for _ in range(WINDOW_LEN)],
             maxlen=WINDOW_LEN,
         )
-        self._imu_window = collections.deque(
-            [np.zeros(10, dtype=np.float32) for _ in range(WINDOW_LEN)],
-            maxlen=WINDOW_LEN,
-        )
-        self._action_window = collections.deque(
-            [np.zeros(4, dtype=np.float32) for _ in range(WINDOW_LEN)],
+        self._temporal_window = collections.deque(
+            [np.zeros(TEMPORAL_DIM, dtype=np.float32) for _ in range(WINDOW_LEN)],
             maxlen=WINDOW_LEN,
         )
         mask = self._render_mask()
         self._current_mask = mask
         imu = self._read_imu()
+        cv2_feat = self._extract_gate_features(mask)
+        nav_feat = self._get_nav_features()
+        act_feat = np.zeros(4, dtype=np.float32)
         self._mask_window.append(mask)
-        self._imu_window.append(imu)
+        self._temporal_window.append(np.concatenate([imu, cv2_feat, nav_feat, act_feat]))
         obs = {
-            "masks":   np.array(self._mask_window, dtype=np.float32),
-            "imu":     np.array(self._imu_window, dtype=np.float32),
-            "cv2":     self._extract_gate_features(mask),
-            "nav":     self._get_nav_features(),
-            "actions": np.array(self._action_window, dtype=np.float32),
-            "state":   self._get_privileged_state(),
+            "masks":    np.array(self._mask_window, dtype=np.float32),
+            "temporal": np.array(self._temporal_window, dtype=np.float32),
+            "state":    self._get_privileged_state(),
         }
         info = {"gates_passed": 0, "academy_level": self.academy_level, "arrived": False, "track_gates": self._get_track_gates()}
         return obs, info
@@ -736,22 +729,23 @@ class GateRacingEnv(gymnasium.Env):
         truncated = self._step_count >= self._max_steps
         if terminated:
             reward = 0.0
+            if self._gates_passed > 0:
+                reward -= 50.0
         else:
             reward = self._reward_fn(pos, lin_vel, euler, ang_vel, passed, offset_mag, clipped_action)
         self._prev_action = clipped_action.copy()
-        self._action_window.append(self._prev_action.astype(np.float32))
         mask = self._render_mask()
         self._current_mask = mask
         imu = self._read_imu()
+        cv2_feat = self._extract_gate_features(mask)
+        nav_feat = self._get_nav_features()
+        act_feat = self._prev_action.astype(np.float32)
         self._mask_window.append(mask)
-        self._imu_window.append(imu)
+        self._temporal_window.append(np.concatenate([imu, cv2_feat, nav_feat, act_feat]))
         obs = {
-            "masks":   np.array(self._mask_window, dtype=np.float32),
-            "imu":     np.array(self._imu_window, dtype=np.float32),
-            "cv2":     self._extract_gate_features(mask),
-            "nav":     self._get_nav_features(),
-            "actions": np.array(self._action_window, dtype=np.float32),
-            "state":   self._get_privileged_state(),
+            "masks":    np.array(self._mask_window, dtype=np.float32),
+            "temporal": np.array(self._temporal_window, dtype=np.float32),
+            "state":    self._get_privileged_state(),
         }
         info = {
             "gates_passed": self._gates_passed,
@@ -807,7 +801,7 @@ if __name__ == "__main__":
         name = ACADEMY_LEVELS[min(lvl, len(ACADEMY_LEVELS)-1)]["name"]
         env = GateRacingEnv(track="circle_small", academy_level=lvl)
         obs, info = env.reset()
-        print(f"Level {lvl} ({name}): masks={obs['masks'].shape} imu={obs['imu'].shape} cv2={obs['cv2'].shape} actions={obs['actions'].shape} state={obs['state'].shape}")
+        print(f"Level {lvl} ({name}): masks={obs['masks'].shape} temporal={obs['temporal'].shape} state={obs['state'].shape}")
         total_r = 0.0
         for s in range(50):
             action = np.zeros(4, dtype=np.float32)

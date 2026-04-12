@@ -9,22 +9,16 @@ if ROOT not in sys.path:
 
 from main.models import ActorCritic, NUM_BINS, PopArtLayer
 
-WINDOW_LEN = 4
-IMU_DIM = 10
-CV2_DIM = 10
-NAV_DIM = 6
-ACT_DIM = 4
+WINDOW_LEN = 16
+TEMPORAL_DIM = 30
 STATE_DIM = 38
 
 
 def make_obs(B, device="cpu"):
     return {
-        "imu": torch.randn(B, WINDOW_LEN, IMU_DIM, device=device),
-        "cv2": torch.randn(B, CV2_DIM, device=device),
-        "nav": torch.randn(B, NAV_DIM, device=device),
-        "actions": torch.randn(B, WINDOW_LEN, ACT_DIM, device=device),
+        "temporal": torch.randn(B, WINDOW_LEN, TEMPORAL_DIM, device=device),
         "state": torch.randn(B, STATE_DIM, device=device),
-        "masks": torch.zeros(B, WINDOW_LEN, 60, 80, device=device),
+        "masks": torch.zeros(B, WINDOW_LEN, 2, 60, 80, device=device),
     }
 
 

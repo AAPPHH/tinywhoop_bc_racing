@@ -96,11 +96,8 @@ class EnvWorker:
     def collect_trajectory(self):
         th = self._torch
         T = self.trajectory_length
-        masks = np.zeros((T, 4, 2, 60, 80), dtype=np.float32)
-        imu = np.zeros((T, 4, 10), dtype=np.float32)
-        cv2_feats = np.zeros((T, 10), dtype=np.float32)
-        nav_feats = np.zeros((T, 6), dtype=np.float32)
-        act_hist = np.zeros((T, 4, 4), dtype=np.float32)
+        masks = np.zeros((T, 16, 2, 60, 80), dtype=np.float32)
+        temporal = np.zeros((T, 16, 30), dtype=np.float32)
         state = np.zeros((T, 38), dtype=np.float32)
         actions = np.zeros((T, 4), dtype=np.float32)
         bin_indices = np.zeros((T, 4), dtype=np.int64)
@@ -114,18 +111,12 @@ class EnvWorker:
         ep_diag = []
         for t in range(T):
             masks[t] = self.obs["masks"]
-            imu[t] = self.obs["imu"]
-            cv2_feats[t] = self.obs["cv2"]
-            nav_feats[t] = self.obs["nav"]
-            act_hist[t] = self.obs["actions"]
+            temporal[t] = self.obs["temporal"]
             state[t] = self.obs["state"]
             with th.no_grad():
                 obs_t = {
                     "masks": th.as_tensor(self.obs["masks"], dtype=th.float32).unsqueeze(0),
-                    "imu": th.as_tensor(self.obs["imu"], dtype=th.float32).unsqueeze(0),
-                    "cv2": th.as_tensor(self.obs["cv2"], dtype=th.float32).unsqueeze(0),
-                    "nav": th.as_tensor(self.obs["nav"], dtype=th.float32).unsqueeze(0),
-                    "actions": th.as_tensor(self.obs["actions"], dtype=th.float32).unsqueeze(0),
+                    "temporal": th.as_tensor(self.obs["temporal"], dtype=th.float32).unsqueeze(0),
                     "state": th.as_tensor(self.obs["state"], dtype=th.float32).unsqueeze(0),
                 }
                 action, lp, idx = self.policy.get_action(obs_t)
@@ -158,12 +149,11 @@ class EnvWorker:
             self.obs = next_obs
         act_diff = np.diff(actions, axis=0)
         act_jerk = float(np.sqrt((act_diff ** 2).mean())) if len(act_diff) else 0.0
-        gyro = imu[:, -1, 0:3]
+        gyro = temporal[:, -1, 0:3]
         gyro_diff = np.diff(gyro, axis=0)
         gyro_jerk = float(np.sqrt((gyro_diff ** 2).mean())) if len(gyro_diff) else 0.0
         return {
-            "masks": masks, "imu": imu, "cv2": cv2_feats, "nav": nav_feats,
-            "actions_hist": act_hist, "state": state,
+            "masks": masks, "temporal": temporal, "state": state,
             "actions": actions, "bin_indices": bin_indices,
             "behavior_log_probs": blp,
             "act_jerk": act_jerk, "gyro_jerk": gyro_jerk,
@@ -330,7 +320,7 @@ def extract_episodes(traj):
     dones = traj["dones"]
     for t in range(len(dones)):
         if dones[t]:
-            ep = {k: traj[k][ep_start:t + 1].copy() for k in ["masks", "imu", "cv2", "nav", "actions_hist", "state", "actions", "bin_indices", "rewards", "dones"]}
+            ep = {k: traj[k][ep_start:t + 1].copy() for k in ["masks", "temporal", "state", "actions", "bin_indices", "rewards", "dones"]}
             episodes.append(ep)
             ep_start = t + 1
     return episodes
@@ -364,10 +354,7 @@ def compute_sil_loss(agent, trajectories, device, gamma):
     for traj in trajectories:
         obs = {
             "masks": torch.as_tensor(traj["masks"], dtype=torch.float32, device=device),
-            "imu": torch.as_tensor(traj["imu"], dtype=torch.float32, device=device),
-            "cv2": torch.as_tensor(traj["cv2"], dtype=torch.float32, device=device),
-            "nav": torch.as_tensor(traj["nav"], dtype=torch.float32, device=device),
-            "actions": torch.as_tensor(traj["actions_hist"], dtype=torch.float32, device=device),
+            "temporal": torch.as_tensor(traj["temporal"], dtype=torch.float32, device=device),
             "state": torch.as_tensor(traj["state"], dtype=torch.float32, device=device),
         }
         indices = torch.as_tensor(traj["bin_indices"], dtype=torch.int64, device=device)
@@ -411,8 +398,7 @@ def compute_bootstrap_batched(agent, batch, B, T, device):
     bootstrap_vals = torch.zeros(B, device=device)
     if len(valid_bi) > 0:
         boot_obs = {}
-        for key, tkey in [("masks", "masks"), ("imu", "imu"), ("cv2", "cv2"),
-                          ("nav", "nav"), ("actions", "actions_hist"), ("state", "state")]:
+        for key, tkey in [("masks", "masks"), ("temporal", "temporal"), ("state", "state")]:
             boot_obs[key] = torch.as_tensor(
                 np.stack([batch[i][tkey][boot_idx[i]] for i in valid_bi]),
                 dtype=torch.float32, device=device,
@@ -548,7 +534,7 @@ def train(cfg):
         worker = pending.pop(future)
         traj_level = worker_levels.pop(future)
         traj = ray.get(future)
-        for k in ["masks", "imu", "cv2", "nav", "actions_hist", "state", "actions", "bin_indices", "behavior_log_probs", "rewards", "dones"]:
+        for k in ["masks", "temporal", "state", "actions", "bin_indices", "behavior_log_probs", "rewards", "dones"]:
             if isinstance(traj[k], np.ndarray):
                 traj[k] = traj[k].copy()
         weights = {k: v.cpu() for k, v in agent.state_dict().items()}
@@ -608,16 +594,13 @@ def train(cfg):
             continue
         update_start = time.time()
         all_masks = torch.as_tensor(np.concatenate([tr["masks"] for tr in batch]), dtype=torch.float32, device=device)
-        all_imu = torch.as_tensor(np.concatenate([tr["imu"] for tr in batch]), dtype=torch.float32, device=device)
-        all_cv2 = torch.as_tensor(np.concatenate([tr["cv2"] for tr in batch]), dtype=torch.float32, device=device)
-        all_nav = torch.as_tensor(np.concatenate([tr["nav"] for tr in batch]), dtype=torch.float32, device=device)
-        all_act_hist = torch.as_tensor(np.concatenate([tr["actions_hist"] for tr in batch]), dtype=torch.float32, device=device)
+        all_temporal = torch.as_tensor(np.concatenate([tr["temporal"] for tr in batch]), dtype=torch.float32, device=device)
         all_state = torch.as_tensor(np.concatenate([tr["state"] for tr in batch]), dtype=torch.float32, device=device)
         all_indices = torch.as_tensor(np.concatenate([tr["bin_indices"] for tr in batch]), dtype=torch.int64, device=device)
         all_blp = torch.as_tensor(np.concatenate([tr["behavior_log_probs"] for tr in batch]), dtype=torch.float32, device=device)
         all_rewards = torch.as_tensor(np.concatenate([tr["rewards"] for tr in batch]), dtype=torch.float32, device=device)
         all_dones = torch.as_tensor(np.concatenate([tr["dones"] for tr in batch]), dtype=torch.float32, device=device)
-        all_obs = {"masks": all_masks, "imu": all_imu, "cv2": all_cv2, "nav": all_nav, "actions": all_act_hist, "state": all_state}
+        all_obs = {"masks": all_masks, "temporal": all_temporal, "state": all_state}
         with autocast("cuda"):
             all_lp, all_entropy, _, all_vd, all_vn, all_aux_pred = agent.evaluate(all_obs, all_indices)
             all_vd = all_vd.squeeze(-1)
